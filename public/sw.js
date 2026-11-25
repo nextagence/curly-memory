@@ -1,5 +1,5 @@
 // Service worker: оболочка приложения доступна офлайн, API всегда с сети.
-const CACHE = 'okoshko-v3';
+const CACHE = 'okoshko-v6';
 const SHELL = ['/', '/app.js', '/styles.css', '/manifest.webmanifest', '/icons/icon-192.png'];
 
 self.addEventListener('install', (e) => {
