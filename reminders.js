@@ -81,7 +81,7 @@ export function createReminders({ db, save, env = process.env, log = console }) 
       `${waBase}/${waPhone}/messages`,
       {
         messaging_product: 'whatsapp',
-        to: String(phone).replace(/\D/g, ''),
+        to: (() => { const d = String(phone).replace(/\D/g, ''); return d.length === 11 && d.startsWith('8') ? '7' + d.slice(1) : d; })(),
         type: 'template',
         template: {
           name: waTemplate,
@@ -110,7 +110,7 @@ export function createReminders({ db, save, env = process.env, log = console }) 
     ticking = true;
     try {
       for (const a of Object.values(db.appointments)) {
-        if (a.status !== 'planned') continue;
+        if (a.status !== 'planned' && a.status !== 'confirmed') continue;
         const m = db.masters[a.masterId];
         if (!m || m.reminders === false) continue;
         const start = zonedToUtc(a.date, a.time, m.timezone);
