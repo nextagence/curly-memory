@@ -152,6 +152,78 @@ try {
   assert.equal(s.status, 404);
   ok('статика: SPA-fallback, защита от выхода из каталога');
 
+  // статусы, финансы, архив услуг, удаление записи
+  token = (await call('POST', '/api/login', { slug: 'anya', password: 'password1' }, false)).data.token;
+  r = await call('POST', '/api/services', { name: 'Финтест', duration: 30, price: 1000 });
+  const fsvc = r.data.service;
+  assert.ok(fsvc.color);
+  const fday = '2031-03-10';
+  r = await call('POST', '/api/appointments', { serviceId: fsvc.id, date: fday, time: '11:00', clientName: 'Ф', clientPhone: '' });
+  assert.equal(r.status, 201);
+  const fa = r.data.appointment;
+  for (const st of ['confirmed', 'arrived', 'done']) {
+    r = await call('PATCH', `/api/appointments/${fa.id}`, { status: st });
+    assert.equal(r.status, 200);
+    assert.equal(r.data.appointment.status, st);
+  }
+  r = await call('PATCH', `/api/appointments/${fa.id}`, { status: 'bogus' });
+  assert.equal(r.status, 400);
+  r = await call('GET', `/api/finance?from=${fday}&to=${fday}`);
+  assert.equal(r.data.revenue, 1000);
+  assert.equal(r.data.done, 1);
+  assert.equal(r.data.services[0].name, 'Финтест');
+  r = await call('GET', '/api/finance?from=2031-01-01&to=2032-12-31');
+  assert.equal(r.status, 400);
+  ok('статусы до «Завершена», выручка в финансах');
+
+  r = await call('DELETE', `/api/services/${fsvc.id}`);
+  assert.equal(r.status, 200);
+  r = await call('GET', '/api/services');
+  assert.equal(r.data.services.find((x) => x.id === fsvc.id).active, false);
+  let pub = await call('GET', '/api/public/anya', null, false);
+  assert.ok(!pub.data.services.some((x) => x.id === fsvc.id));
+  r = await call('POST', `/api/services/${fsvc.id}/restore`);
+  assert.equal(r.data.service.active, true);
+  ok('услуга уходит в архив и возвращается; клиентам архивная не видна');
+
+  r = await call('DELETE', `/api/appointments/${fa.id}`);
+  assert.equal(r.status, 200);
+  r = await call('GET', `/api/finance?from=${fday}&to=${fday}`);
+  assert.equal(r.data.revenue, 0);
+  ok('удаление записи убирает её из финансов');
+
+  // CORS для нативной оболочки
+  s = await fetch(base + '/api/config', { method: 'OPTIONS', headers: { origin: 'capacitor://localhost', 'access-control-request-method': 'GET' } });
+  assert.equal(s.status, 204);
+  assert.equal(s.headers.get('access-control-allow-origin'), 'capacitor://localhost');
+  s = await fetch(base + '/api/config', { headers: { origin: 'https://evil.example' } });
+  assert.equal(s.headers.get('access-control-allow-origin'), null);
+  ok('CORS: capacitor разрешён, чужой origin нет');
+
+  // юридические страницы
+  s = await fetch(base + '/privacy');
+  assert.equal(s.status, 200);
+  assert.ok(!(await s.text()).includes('{{'));
+  s = await fetch(base + '/terms');
+  assert.equal(s.status, 200);
+  ok('/privacy и /terms отдаются, плейсхолдеры подставлены');
+
+  // удаление аккаунта
+  r = await call('POST', '/api/register', { name: 'Удал', slug: 'deleteme', password: 'password3', geo: 'KZ', currency: 'KZT' }, false);
+  assert.equal(r.status, 201);
+  token = r.data.token;
+  r = await call('POST', '/api/me/delete', { password: 'wrong-pass' });
+  assert.equal(r.status, 403);
+  r = await call('POST', '/api/me/delete', { password: 'password3' });
+  assert.equal(r.status, 200);
+  r = await call('GET', '/api/me');
+  assert.equal(r.status, 401);
+  r = await call('POST', '/api/login', { slug: 'deleteme', password: 'password3' }, false);
+  assert.equal(r.status, 401);
+  r = await call('GET', '/api/public/deleteme', null, false);
+  assert.equal(r.status, 404);
+  ok('удаление аккаунта: неверный пароль 403, верный 200, токен и вход мертвы');
+
   console.log(`\nГотово: ${passed} проверок прошли.`);
 } catch (e) {
   console.error('\nПровал:', e);
