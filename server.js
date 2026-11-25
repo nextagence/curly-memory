@@ -16,6 +16,9 @@ const BOOKING_HORIZON_DAYS = 60;
 const RESERVED_SLUGS = new Set(['api', 'm', 'admin', 'app', 'login', 'static', 'public', 'sw', 'manifest']);
 
 const CONFIG = enabledConfig();
+const CORS_ORIGINS = new Set(['capacitor://localhost', 'https://localhost', 'http://localhost', ...String(process.env.CORS_ORIGINS || '').split(',').map((x) => x.trim()).filter(Boolean)]);
+const CONTACT_EMAIL = process.env.CONTACT_EMAIL || 'support@example.com';
+const OPERATOR = process.env.OPERATOR_NAME || 'владелец сервиса';
 
 // ───────────────────────── хранилище (JSON-файл) ─────────────────────────
 let db = { masters: {}, sessions: {}, services: {}, clients: {}, appointments: {} };
@@ -157,7 +160,7 @@ function normPhone(s) {
   if (digits.length < 7 || digits.length > 15) return null;
   return (raw.startsWith('+') ? '+' : '') + digits;
 }
-const digitsOf = (s) => String(s || '').replace(/\D/g, '');
+const digitsOf = (s) => { const d = String(s || '').replace(/\D/g, ''); return d.length === 11 && d.startsWith('8') ? '7' + d.slice(1) : d; };
 
 // ───────────────────────── доменная логика ─────────────────────────
 const busyFor = (masterId, date, ignoreId) =>
@@ -199,7 +202,8 @@ const publicMaster = (m) => ({
   contact: m.contact,
   reminders: m.reminders !== false,
 });
-const serviceOut = (s) => ({ id: s.id, name: s.name, duration: s.duration, price: s.price, active: s.active });
+const SERVICE_COLORS = ['#F4A6A6', '#A8C8F5', '#F5E3A0', '#B7B5F2', '#F2B3D6', '#C6F28E', '#9EEBC4', '#F5C39B'];
+const serviceOut = (s, extra = {}) => ({ id: s.id, name: s.name, duration: s.duration, price: s.price, active: s.active, color: s.color || SERVICE_COLORS[0], ...extra });
 const apptOut = (a) => {
   const c = a.clientId ? db.clients[a.clientId] : null;
   return {
@@ -335,19 +339,45 @@ route('PUT', '/api/me', ({ master, body }) => {
   return { me: publicMaster(master) };
 }, true);
 
+route('POST', '/api/me/delete', ({ req, master, body }) => {
+  rateLimit(req, 'delete', 10, 60_000);
+  if (typeof body.password !== 'string' || !checkPassword(body.password, master.salt, master.hash)) throw new HttpError(403, 'Неверный пароль');
+  for (const [id, a] of Object.entries(db.appointments)) if (a.masterId === master.id) delete db.appointments[id];
+  for (const [id, c] of Object.entries(db.clients)) if (c.masterId === master.id) delete db.clients[id];
+  for (const [id, s] of Object.entries(db.services)) if (s.masterId === master.id) delete db.services[id];
+  for (const [t, s] of Object.entries(db.sessions)) if (s.masterId === master.id) delete db.sessions[t];
+  delete db.masters[master.id];
+  save();
+  return { ok: true };
+}, true);
+
 // услуги
 function parseService(b) {
   return {
     name: str(b.name, 1, 60, 'Название'),
     duration: Math.round(num(b.duration, 5, 600, 'Длительность (мин)')),
     price: Math.round(num(b.price, 0, 1e9, 'Цена') * 100) / 100,
+    ...(b.color === undefined ? {} : { color: validColor(b.color) }),
   };
 }
-route('GET', '/api/services', ({ master }) => ({
-  services: Object.values(db.services).filter((s) => s.masterId === master.id && s.active).map(serviceOut),
-}), true);
+function validColor(c) {
+  if (!SERVICE_COLORS.includes(c)) throw bad('Цвет неверный');
+  return c;
+}
+route('GET', '/api/services', ({ master }) => {
+  const month = nowIn(master.timezone).date.slice(0, 7);
+  const counts = {};
+  for (const a of Object.values(db.appointments)) {
+    if (a.masterId === master.id && a.status !== 'cancelled' && a.date.startsWith(month)) counts[a.serviceId] = (counts[a.serviceId] || 0) + 1;
+  }
+  return {
+    colors: SERVICE_COLORS,
+    services: Object.values(db.services).filter((s) => s.masterId === master.id).map((s) => serviceOut(s, { monthCount: counts[s.id] || 0 })),
+  };
+}, true);
 route('POST', '/api/services', ({ master, body }) => {
-  const s = { id: uid(), masterId: master.id, active: true, ...parseService(body) };
+  const own = Object.values(db.services).filter((x) => x.masterId === master.id).length;
+  const s = { id: uid(), masterId: master.id, active: true, color: SERVICE_COLORS[own % SERVICE_COLORS.length], ...parseService(body) };
   db.services[s.id] = s;
   save();
   return created({ service: serviceOut(s) });
@@ -366,6 +396,13 @@ route('DELETE', '/api/services/:id', ({ master, params }) => {
   save();
   return { ok: true };
 }, true);
+route('POST', '/api/services/:id/restore', ({ master, params }) => {
+  const s = db.services[params.id];
+  if (!s || s.masterId !== master.id) throw new HttpError(404, 'Услуга не найдена');
+  s.active = true;
+  save();
+  return { service: serviceOut(s) };
+}, true);
 
 // клиенты
 function clientStats(masterId) {
@@ -377,7 +414,7 @@ function clientStats(masterId) {
       s.visits++;
       s.spent += a.price;
       if (a.date > s.last) s.last = a.date;
-    } else if (a.status === 'planned') s.upcoming++;
+    } else if (a.status === 'planned' || a.status === 'confirmed') s.upcoming++;
   }
   return stats;
 }
@@ -476,7 +513,7 @@ route('PATCH', '/api/appointments/:id', ({ master, params, body }) => {
   if (!a || a.masterId !== master.id) throw new HttpError(404, 'Запись не найдена');
   const next = { date: a.date, time: a.time, status: a.status, note: a.note, price: a.price };
   if (body.status !== undefined) {
-    if (!['planned', 'done', 'cancelled'].includes(body.status)) throw bad('Статус неверный');
+    if (!['planned', 'confirmed', 'arrived', 'done', 'cancelled'].includes(body.status)) throw bad('Статус неверный');
     next.status = body.status;
   }
   if (body.date !== undefined) {
@@ -499,6 +536,53 @@ route('PATCH', '/api/appointments/:id', ({ master, params, body }) => {
   Object.assign(a, next);
   save();
   return { appointment: apptOut(a) };
+}, true);
+
+route('DELETE', '/api/appointments/:id', ({ master, params }) => {
+  const a = db.appointments[params.id];
+  if (!a || a.masterId !== master.id) throw new HttpError(404, 'Запись не найдена');
+  delete db.appointments[a.id];
+  save();
+  return { ok: true };
+}, true);
+
+// финансы: выручка считается по завершённым записям
+route('GET', '/api/finance', ({ master, query }) => {
+  const from = query.get('from');
+  const to = query.get('to');
+  if (!validDate(from) || !validDate(to) || from > to || to > addDays(from, 93)) throw bad('Период указан неверно (до 93 дней)');
+  const list = Object.values(db.appointments).filter((a) => a.masterId === master.id && a.date >= from && a.date <= to);
+  const t = { revenue: 0, done: 0, expected: 0, upcoming: 0, cancelled: 0 };
+  const days = {};
+  const byService = {};
+  for (const a of list) {
+    if (a.status === 'done') {
+      t.revenue += a.price;
+      t.done++;
+      days[a.date] = (days[a.date] || 0) + a.price;
+      const k = a.serviceName;
+      const e = (byService[k] ||= { name: k, count: 0, revenue: 0 });
+      e.count++;
+      e.revenue += a.price;
+    } else if (a.status === 'cancelled') t.cancelled++;
+    else {
+      t.expected += a.price;
+      t.upcoming++;
+    }
+  }
+  const round = (n) => Math.round(n * 100) / 100;
+  return {
+    from,
+    to,
+    revenue: round(t.revenue),
+    done: t.done,
+    average: t.done ? round(t.revenue / t.done) : 0,
+    expected: round(t.expected),
+    upcoming: t.upcoming,
+    cancelled: t.cancelled,
+    days: Object.entries(days).map(([date, sum]) => ({ date, sum: round(sum) })).sort((x, y) => x.date.localeCompare(y.date)),
+    services: Object.values(byService).map((e) => ({ ...e, revenue: round(e.revenue) })).sort((x, y) => y.revenue - x.revenue),
+  };
 }, true);
 
 // публичная запись клиентом
@@ -543,7 +627,7 @@ route('POST', '/api/public/:slug/book', ({ req, params, body }) => {
   const client = findOrCreateClient(m.id, name, phone);
   if (body.consent === true) client.waOptIn = true;
   const today = nowIn(m.timezone).date;
-  const active = Object.values(db.appointments).filter((a) => a.clientId === client.id && a.status === 'planned' && a.date >= today).length;
+  const active = Object.values(db.appointments).filter((a) => a.clientId === client.id && (a.status === 'planned' || a.status === 'confirmed') && a.date >= today).length;
   if (active >= 3) throw new HttpError(429, 'Слишком много активных записей. Свяжитесь с мастером.');
   const a = {
     id: uid(),
@@ -595,6 +679,7 @@ function serveStatic(req, res, pathname) {
     rel = '/';
   }
   if (rel === '/') rel = '/index.html';
+  if (rel === '/privacy' || rel === '/terms') rel += '.html';
   let file = path.join(PUBLIC_DIR, path.normalize(rel));
   if (!file.startsWith(PUBLIC_DIR + path.sep)) {
     res.writeHead(403, SECURITY_HEADERS);
@@ -615,6 +700,11 @@ function serveStatic(req, res, pathname) {
     file = path.join(PUBLIC_DIR, 'index.html'); // SPA-страницы вроде /m/slug
     ext = '.html';
   }
+  if (file.endsWith(`${path.sep}privacy.html`) || file.endsWith(`${path.sep}terms.html`)) {
+    const html = fs.readFileSync(file, 'utf8').replaceAll('{{CONTACT_EMAIL}}', CONTACT_EMAIL).replaceAll('{{OPERATOR}}', OPERATOR);
+    res.writeHead(200, { ...SECURITY_HEADERS, 'content-type': MIME['.html'], 'cache-control': 'no-cache' });
+    return res.end(req.method === 'HEAD' ? undefined : html);
+  }
   const cache = ext === '.png' ? 'public, max-age=86400' : 'no-cache';
   res.writeHead(200, { ...SECURITY_HEADERS, 'content-type': MIME[ext] || 'application/octet-stream', 'cache-control': cache });
   if (req.method === 'HEAD') return res.end();
@@ -629,6 +719,18 @@ const server = http.createServer(async (req, res) => {
     if (!pathname.startsWith('/api/')) {
       if (req.method !== 'GET' && req.method !== 'HEAD') throw new HttpError(405, 'Method not allowed');
       return serveStatic(req, res, pathname);
+    }
+    const origin = req.headers.origin;
+    if (origin && CORS_ORIGINS.has(origin)) {
+      res.setHeader('access-control-allow-origin', origin);
+      res.setHeader('vary', 'Origin');
+      res.setHeader('access-control-allow-methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+      res.setHeader('access-control-allow-headers', 'authorization,content-type');
+      res.setHeader('access-control-max-age', '86400');
+    }
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, SECURITY_HEADERS);
+      return res.end();
     }
     let matched = null;
     let pathMatched = false;
