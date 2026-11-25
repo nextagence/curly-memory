@@ -1,0 +1,12 @@
+{
+  "name": "okoshko",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Запись клиентов для мастеров: расписание, клиенты, запись по ссылке. Выбор гео и валюты.",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/smoke.mjs"
+  }
+}
